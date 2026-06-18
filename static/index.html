@@ -12,11 +12,10 @@
         <div id="overlay">
             <div id="status"></div>
             <div id="controls">
-                <div id="necklaceSelector">
-                    <button class="necklace-btn active" data-id="1">1</button>
-                    <button class="necklace-btn" data-id="2">2</button>
-                    <button class="necklace-btn" data-id="3">3</button>
-                </div>
+                <button id="necklaceOpenBtn" class="control-btn">
+                    <img id="necklacePreview" src="" alt="">
+                    <span>Necklaces</span>
+                </button>
                 <label id="clipToggle" class="toggle-label">
                     <input type="checkbox" id="clipCheckbox" checked>
                     <span class="toggle-slider"></span>
@@ -26,6 +25,12 @@
             </div>
         </div>
         <div id="connectionStatus">Connecting...</div>
+        <div id="sheetBackdrop"></div>
+        <div id="sheet">
+            <div id="sheetHandle"></div>
+            <div id="sheetTitle">Choose a Necklace</div>
+            <div id="sheetGrid"></div>
+        </div>
     </div>
     <script src="/static/app.js"></script>
 </body>

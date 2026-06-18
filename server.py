@@ -20,14 +20,10 @@ from mediapipe.tasks.python import vision
 # CONFIG
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR
 
-NECKLACE_FILES = {
-    1: "necklace.png",
-    2: "necklace_2.png",
-    3: "necklace_3.png",
-}
+NECKLACE_DIR = BASE_DIR / "static" / "necklaces"
 
 FACE_MODEL = str(ASSETS_DIR / "face_landmarker.task")
 POSE_MODEL = str(ASSETS_DIR / "pose_landmark_heavy.task")
@@ -677,9 +673,10 @@ class TryOnSession:
 
 print("Loading necklace images...")
 necklaces = {}
-for nid, fname in NECKLACE_FILES.items():
-    fpath = str(ASSETS_DIR / fname)
-    img = cv2.imread(fpath, cv2.IMREAD_UNCHANGED)
+NECKLACE_DIR.mkdir(parents=True, exist_ok=True)
+for fpath in sorted(NECKLACE_DIR.glob("*.png")):
+    nid = fpath.stem  # e.g. "gold_chain" from "gold_chain.png"
+    img = cv2.imread(str(fpath), cv2.IMREAD_UNCHANGED)
     if img is None:
         print(f"WARNING: Could not load {fpath}")
         continue
@@ -688,7 +685,7 @@ for nid, fname in NECKLACE_FILES.items():
         img = np.dstack([img, alpha])
     img = crop_transparent(img)
     necklaces[nid] = img
-    print(f"  Loaded {fname}: {img.shape}")
+    print(f"  Loaded {fpath.name}: {img.shape}")
 
 print("Loading MediaPipe models...")
 face_options = vision.FaceLandmarkerOptions(
@@ -722,7 +719,7 @@ async def index():
 async def list_necklaces():
     items = []
     for nid in sorted(necklaces.keys()):
-        items.append({"id": nid, "name": f"Necklace {nid}"})
+        items.append({"id": nid, "name": nid.replace("_", " ").title(), "image": f"/static/necklaces/{nid}.png"})
     return {"necklaces": items}
 
 

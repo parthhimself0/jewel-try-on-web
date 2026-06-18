@@ -5,7 +5,11 @@
     const connectionEl = document.getElementById('connectionStatus');
     const resetBtn = document.getElementById('resetBtn');
     const clipCheckbox = document.getElementById('clipCheckbox');
-    const necklaceBtns = document.querySelectorAll('.necklace-btn');
+    const necklaceOpenBtn = document.getElementById('necklaceOpenBtn');
+    const necklacePreview = document.getElementById('necklacePreview');
+    const sheetBackdrop = document.getElementById('sheetBackdrop');
+    const sheet = document.getElementById('sheet');
+    const sheetGrid = document.getElementById('sheetGrid');
 
     let ws = null;
     let video = null;
@@ -106,16 +110,54 @@
     }
 
     // --- Controls ---
-    necklaceBtns.forEach(btn => {
-        btn.addEventListener('click', () => {
-            necklaceBtns.forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            currentNecklace = parseInt(btn.dataset.id);
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'select_necklace', id: currentNecklace }));
-            }
+    function openSheet() {
+        sheetBackdrop.classList.add('open');
+        sheet.classList.add('open');
+    }
+
+    function closeSheet() {
+        sheetBackdrop.classList.remove('open');
+        sheet.classList.remove('open');
+    }
+
+    function selectNecklace(id) {
+        currentNecklace = id;
+        sheetGrid.querySelectorAll('.sheet-item').forEach(el => {
+            el.classList.toggle('active', el.dataset.id === id);
         });
-    });
+        const item = sheetGrid.querySelector(`.sheet-item[data-id="${id}"]`);
+        if (item) necklacePreview.src = item.querySelector('img').src;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'select_necklace', id: currentNecklace }));
+        }
+        closeSheet();
+    }
+
+    necklaceOpenBtn.addEventListener('click', openSheet);
+    sheetBackdrop.addEventListener('click', closeSheet);
+
+    async function loadNecklaces() {
+        try {
+            const res = await fetch('/necklaces');
+            const data = await res.json();
+            sheetGrid.innerHTML = '';
+            data.necklaces.forEach(n => {
+                const div = document.createElement('div');
+                div.className = 'sheet-item' + (n.id === currentNecklace ? ' active' : '');
+                div.dataset.id = n.id;
+                div.innerHTML = `<img src="${n.image}" alt="${n.name}" loading="lazy">`;
+                div.addEventListener('click', () => selectNecklace(n.id));
+                sheetGrid.appendChild(div);
+            });
+            if (data.necklaces.length > 0) {
+                necklacePreview.src = data.necklaces[0].image;
+            }
+        } catch (e) {
+            console.error('Failed to load necklaces:', e);
+        }
+    }
+
+    loadNecklaces();
 
     resetBtn.addEventListener('click', () => {
         if (ws && ws.readyState === WebSocket.OPEN) {
