@@ -195,7 +195,8 @@ def find_necklace_outline_width(img):
     mask = (alpha > 80).astype(np.uint8)
     h, w = mask.shape
     max_width = 0
-    for row in range(h // 2, h):
+    search_end = max(1, h // 3)
+    for row in range(search_end):
         cols = np.where(mask[row, :] > 0)[0]
         if len(cols) > 2:
             row_width = cols[-1] - cols[0]
@@ -204,6 +205,19 @@ def find_necklace_outline_width(img):
     if max_width < 5:
         return None
     return max_width
+
+
+def find_necklace_opening_anchor(img):
+    alpha = img[:, :, 3]
+    mask = (alpha > 80).astype(np.uint8)
+    h, w = mask.shape
+    for row in range(h):
+        cols = np.where(mask[row, :] > 0)[0]
+        if len(cols) > 2:
+            if cols[0] < w // 2 and cols[-1] >= w // 2:
+                center_x = (cols[0] + cols[-1]) // 2
+                return (center_x, row)
+    return (w // 2, 0)
 
 
 def find_neck_edges_from_segmentation(seg_mask, jaw_left, jaw_right, shoulder_cy, h, w):
@@ -293,11 +307,71 @@ def find_shoulder_contour_from_segmentation(seg_mask, jaw_left, jaw_right, shoul
                 return {
                     'center_x': int(center_x_mask * w / mw),
                     'center_y': int(row * h / mh),
+                    'left_x': int(left_x * w / mw),
+                    'right_x': int(right_x * w / mw),
                 }
         prev_left_x = left_x
         prev_right_x = right_x
         prev_row = row
     return None
+
+
+# ============================================================
+# FACE / NECK MASK FOR NECKLACE OCCLUSION
+# ============================================================
+
+JAW_LEFT_INDICES = [172, 149, 150, 136, 148, 152]
+JAW_RIGHT_INDICES = [397, 379, 378, 365, 361, 323]
+FACE_TOP_INDEX = 10
+
+FACE_OVAL = [
+    10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+    397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+    172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109, 10,
+]
+
+
+def create_face_neck_mask(h, w, face_landmarks, neck_bottom_y):
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if not face_landmarks:
+        return mask
+    lm = face_landmarks
+
+    pts = []
+    for idx in FACE_OVAL:
+        pts.append((int(lm[idx].x * w), int(lm[idx].y * h)))
+
+    left_x = min(p[0] for p in pts)
+    right_x = max(p[0] for p in pts)
+    jaw_bottom_y = max(p[1] for p in pts)
+    top_y = min(p[1] for p in pts)
+    ext_y = min(jaw_bottom_y + int((jaw_bottom_y - top_y) * 0.3), neck_bottom_y)
+
+    pts += [(right_x, ext_y), (left_x, ext_y)]
+
+    poly = np.array(pts, dtype=np.int32)
+    cv2.fillPoly(mask, [poly], 255)
+    mask = cv2.GaussianBlur(mask, (11, 11), 3)
+    return mask
+
+
+def apply_face_neck_occlusion(resized, mask, x, y, feather=3):
+    oh, ow = resized.shape[:2]
+    fh, fw = mask.shape[:2]
+    x1, y1 = max(int(x), 0), max(int(y), 0)
+    x2, y2 = min(int(x) + ow, fw), min(int(y) + oh, fh)
+    if x2 <= x1 or y2 <= y1:
+        return resized
+    ox1, oy1 = x1 - int(x), y1 - int(y)
+    ox2, oy2 = ox1 + (x2 - x1), oy1 + (y2 - y1)
+    face_region = mask[y1:y2, x1:x2].astype(np.float32) / 255.0
+    if feather > 0:
+        kernel = feather * 2 + 1
+        face_region = cv2.GaussianBlur(face_region, (kernel, kernel), feather / 3)
+    alpha = resized[oy1:oy2, ox1:ox2, 3:4].astype(np.float32) / 255.0
+    alpha *= (1.0 - face_region[:, :, np.newaxis])
+    resized[oy1:oy2, ox1:ox2, 3] = (alpha[:, :, 0] * 255).astype(np.uint8)
+    return resized
 
 
 # ============================================================
@@ -382,6 +456,7 @@ class TryOnSession:
         # Overlay cache
         self.last_overlay = None
         self.last_overlay_key = None
+        self.face_clip_enabled = True
 
         # Last known good shoulder contour (for fallback when silhouette fails)
         self.last_good_shoulder_contour = None
@@ -391,9 +466,11 @@ class TryOnSession:
         self.necklace_data = {}
         for nid, img in self.necklaces.items():
             opening = find_necklace_outline_width(img)
+            anchor = find_necklace_opening_anchor(img)
             self.necklace_data[nid] = {
                 'image': img,
                 'opening_width': opening,
+                'opening_anchor': anchor,
             }
 
     def select_necklace(self, nid):
@@ -480,6 +557,13 @@ class TryOnSession:
         else:
             self.good_contour_frame_count += 1
 
+        # Face/neck occlusion mask
+        face_neck_mask = None
+        if face_result.face_landmarks:
+            best_contour_for_mask = shoulder_contour or self.last_good_shoulder_contour
+            neck_bottom = best_contour_for_mask['center_y'] if best_contour_for_mask else shoulder_cy
+            face_neck_mask = create_face_neck_mask(h, w, face_result.face_landmarks[0], neck_bottom)
+
         # Necklace position
         status_msg = None
         self.frame_counter += 1
@@ -493,6 +577,12 @@ class TryOnSession:
             best_contour = shoulder_contour or self.last_good_shoulder_contour
             if best_contour:
                 self.target_neck_cy = best_contour['center_y']
+                # Tilt-aware offset: shift Y along shoulder line direction
+                if 'left_x' in best_contour and 'right_x' in best_contour:
+                    contour_span = best_contour['right_x'] - best_contour['left_x']
+                    if contour_span > 0:
+                        tilt_ratio = (best_contour['center_x'] - shoulder_cx) / max(contour_span, 1)
+                        self.target_neck_cy += int(tilt_ratio * abs(ls_y - rs_y) * 0.3)
             else:
                 self.target_neck_cy = shoulder_cy
             if necklace_outline_width is not None:
@@ -508,11 +598,13 @@ class TryOnSession:
         self.last_necklace_width = int(self.last_necklace_width + (self.target_necklace_width - self.last_necklace_width) * LERP_FACTOR)
         self.last_angle = self.last_angle + (self.target_angle - self.last_angle) * LERP_FACTOR
 
-        y = self.last_neck_cy
         necklace_width = self.last_necklace_width
         angle_out = self.last_angle
         scale = necklace_width / necklace.shape[1]
         necklace_height = int(necklace.shape[0] * scale)
+        opening_anchor = nd['opening_anchor']
+        anchor_x = opening_anchor[0] * scale
+        anchor_y = opening_anchor[1] * scale
 
         if necklace_width > 20 and necklace_height > 20:
             shoulder_half = shoulder_width // 4
@@ -532,13 +624,13 @@ class TryOnSession:
             right_brightness = np.mean(right_region) if right_region.size > 0 else 128
             lighting_shift = (right_brightness - left_brightness) / 255.0
 
-            cur_key = (necklace_width, necklace_height, round(angle_out, 2))
+            cur_key = (self.current_necklace_id, necklace_width, necklace_height, round(angle_out, 2))
             if cur_key == self.last_overlay_key and self.last_overlay is not None:
                 resized = self.last_overlay
             else:
                 resized = cv2.resize(necklace, (necklace_width, necklace_height), interpolation=cv2.INTER_AREA)
                 resized = edge_glow(resized, glow_radius=3, intensity=0.12)
-                center = (resized.shape[1] // 2, resized.shape[0] // 2)
+                center = (anchor_x, anchor_y)
                 M = cv2.getRotationMatrix2D(center, angle_out, 1.0)
                 cos = abs(M[0, 0])
                 sin = abs(M[0, 1])
@@ -559,9 +651,17 @@ class TryOnSession:
                 self.last_overlay = resized
                 self.last_overlay_key = cur_key
 
-            x = self.last_neck_cx - resized.shape[1] // 2
-            add_skin_shadow(frame_bgr, resized[:, :, 3], x, y, offset_x=4, offset_y=6, blur=21, opacity=0.35)
-            overlay_realistic(frame_bgr, resized, x, y, lighting_shift=lighting_shift)
+            anchor_canvas_x = anchor_x + (resized.shape[1] - necklace_width) / 2
+            anchor_canvas_y = anchor_y + (resized.shape[0] - necklace_height) / 2
+            x = self.last_neck_cx - anchor_canvas_x
+            y = self.last_neck_cy - anchor_canvas_y
+
+            if face_neck_mask is not None and self.face_clip_enabled:
+                resized = resized.copy()
+                apply_face_neck_occlusion(resized, face_neck_mask, int(x), int(y), feather=3)
+
+            add_skin_shadow(frame_bgr, resized[:, :, 3], int(x), int(y), offset_x=4, offset_y=6, blur=21, opacity=0.35)
+            overlay_realistic(frame_bgr, resized, int(x), int(y), lighting_shift=lighting_shift)
 
             # Draw debug landmarks
             cv2.circle(frame_bgr, (ls_x, ls_y), 4, (0, 255, 0), -1)
@@ -667,6 +767,10 @@ async def websocket_endpoint(websocket: WebSocket):
             elif msg.get("type") == "reset_calibration":
                 session.reset_calibration()
                 print("Calibration reset")
+
+            elif msg.get("type") == "toggle_face_clip":
+                session.face_clip_enabled = msg.get("enabled", True)
+                print(f"Face clip: {'on' if session.face_clip_enabled else 'off'}")
 
     except WebSocketDisconnect:
         print("Client disconnected")

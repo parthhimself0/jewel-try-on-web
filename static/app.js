@@ -4,6 +4,7 @@
     const statusEl = document.getElementById('status');
     const connectionEl = document.getElementById('connectionStatus');
     const resetBtn = document.getElementById('resetBtn');
+    const clipCheckbox = document.getElementById('clipCheckbox');
     const necklaceBtns = document.querySelectorAll('.necklace-btn');
 
     let ws = null;
@@ -119,6 +120,12 @@
     resetBtn.addEventListener('click', () => {
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'reset_calibration' }));
+        }
+    });
+
+    clipCheckbox.addEventListener('change', () => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'toggle_face_clip', enabled: clipCheckbox.checked }));
         }
     });
 
