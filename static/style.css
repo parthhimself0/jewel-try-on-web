@@ -1,0 +1,132 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background: #000;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+#app {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+#videoCanvas {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+#overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    pointer-events: none;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 20px;
+}
+
+#status {
+    align-self: flex-start;
+    background: rgba(0, 0, 0, 0.6);
+    color: #ffcc00;
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    display: none;
+    backdrop-filter: blur(4px);
+}
+
+#status.visible {
+    display: block;
+}
+
+#controls {
+    align-self: center;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    pointer-events: auto;
+}
+
+#necklaceSelector {
+    display: flex;
+    gap: 8px;
+}
+
+.necklace-btn {
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    background: rgba(0, 0, 0, 0.5);
+    color: #fff;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    backdrop-filter: blur(4px);
+}
+
+.necklace-btn:hover {
+    border-color: rgba(255, 255, 255, 0.6);
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.necklace-btn.active {
+    border-color: #ffcc00;
+    background: rgba(255, 204, 0, 0.2);
+    color: #ffcc00;
+}
+
+#resetBtn {
+    height: 44px;
+    padding: 0 20px;
+    border-radius: 22px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    background: rgba(0, 0, 0, 0.5);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    backdrop-filter: blur(4px);
+}
+
+#resetBtn:hover {
+    border-color: rgba(255, 255, 255, 0.6);
+    background: rgba(255, 255, 255, 0.1);
+}
+
+#connectionStatus {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    background: rgba(0, 0, 0, 0.6);
+    color: #aaa;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    backdrop-filter: blur(4px);
+}
+
+#connectionStatus.connected {
+    color: #4caf50;
+}
+
+#connectionStatus.error {
+    color: #f44336;
+}

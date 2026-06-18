@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jewelry Virtual Try-On</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div id="app">
+        <canvas id="videoCanvas"></canvas>
+        <div id="overlay">
+            <div id="status"></div>
+            <div id="controls">
+                <div id="necklaceSelector">
+                    <button class="necklace-btn active" data-id="1">1</button>
+                    <button class="necklace-btn" data-id="2">2</button>
+                    <button class="necklace-btn" data-id="3">3</button>
+                </div>
+                <button id="resetBtn" title="Reset calibration">Reset</button>
+            </div>
+        </div>
+        <div id="connectionStatus">Connecting...</div>
+    </div>
+    <script src="/static/app.js"></script>
+</body>
+</html>
