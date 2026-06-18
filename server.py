@@ -190,22 +190,20 @@ def crop_transparent(img):
     return img[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
 
 
-def find_necklace_opening(img):
+def find_necklace_outline_width(img):
     alpha = img[:, :, 3]
     mask = (alpha > 80).astype(np.uint8)
     h, w = mask.shape
-    min_width = w
-    min_row = -1
-    for row in range(h):
+    max_width = 0
+    for row in range(h // 2, h):
         cols = np.where(mask[row, :] > 0)[0]
         if len(cols) > 2:
             row_width = cols[-1] - cols[0]
-            if row_width < min_width:
-                min_width = row_width
-                min_row = row
-    if min_row < 0 or min_width >= w * 0.95 or min_width < 5:
+            if row_width > max_width:
+                max_width = row_width
+    if max_width < 5:
         return None
-    return min_width
+    return max_width
 
 
 def find_neck_edges_from_segmentation(seg_mask, jaw_left, jaw_right, shoulder_cy, h, w):
@@ -255,6 +253,51 @@ def find_neck_edges_from_segmentation(seg_mask, jaw_left, jaw_right, shoulder_cy
         'neck_left': int(min_left * w / mw),
         'neck_right': int(min_right * w / mw),
     }
+
+
+def find_shoulder_contour_from_segmentation(seg_mask, jaw_left, jaw_right, shoulder_cy, h, w):
+    if seg_mask is None:
+        return None
+    if hasattr(seg_mask, 'numpy_view'):
+        seg_mask = seg_mask.numpy_view()
+    seg_mask = np.array(seg_mask)
+    mh, mw = seg_mask.shape[:2]
+    binary = (seg_mask > 0.5).astype(np.uint8) if seg_mask.max() <= 1.0 else (seg_mask > 128).astype(np.uint8)
+    jl_x, jl_y = int(jaw_left[0] * mw), int(jaw_left[1] * mh)
+    jr_x, jr_y = int(jaw_right[0] * mw), int(jaw_right[1] * mh)
+    shoulder_cy_mask = int(shoulder_cy * mh / h)
+    y_start = max(0, min(jl_y, jr_y))
+    y_end = min(mh, shoulder_cy_mask + int(mh * 0.1))
+    if y_end <= y_start + 5:
+        return None
+    search_x_min = max(0, min(jl_x, jr_x) - int(mw * 0.3))
+    search_x_max = min(mw, max(jl_x, jr_x) + int(mw * 0.3))
+    prev_left_x = None
+    prev_right_x = None
+    prev_row = None
+    ANGLE_THRESHOLD = 0.25
+    for row in range(y_start, y_end):
+        cols = np.where(binary[row, search_x_min:search_x_max] > 0)[0]
+        if len(cols) < 2:
+            continue
+        left_x = cols[0] + search_x_min
+        right_x = cols[-1] + search_x_min
+        if prev_left_x is not None and prev_row is not None:
+            dy = row - prev_row
+            left_dx = left_x - prev_left_x
+            right_dx = right_x - prev_right_x
+            left_angle = left_dx / dy
+            right_angle = right_dx / dy
+            if left_angle < -ANGLE_THRESHOLD and right_angle > ANGLE_THRESHOLD:
+                center_x_mask = (left_x + right_x) // 2
+                return {
+                    'center_x': int(center_x_mask * w / mw),
+                    'center_y': int(row * h / mh),
+                }
+        prev_left_x = left_x
+        prev_right_x = right_x
+        prev_row = row
+    return None
 
 
 # ============================================================
@@ -309,9 +352,7 @@ class OneEuroFilter:
 INF_SCALE = 0.5
 SKIP_FRAMES = 5
 LERP_FACTOR = 0.8
-WIDTH_PADDING = 1.35
-Y_LOWER = 35
-CALIBRATION_FRAMES = 15
+WIDTH_PADDING = 1.25
 
 
 class TryOnSession:
@@ -320,13 +361,6 @@ class TryOnSession:
         self.pose_landmarker = pose_landmarker
         self.necklaces = necklaces
         self.current_necklace_id = 1
-
-        # Calibration
-        self.calibrated = False
-        self.cal_y_offset = 0.0
-        self.cal_width_ratio = 0.65
-        self.cal_neck_width = 0
-        self.calibration_attempts = 0
 
         # Smoothing
         self.one_euro_ls_x = OneEuroFilter(min_cutoff=0.3, beta=1.0)
@@ -352,7 +386,7 @@ class TryOnSession:
         # Precompute necklace data
         self.necklace_data = {}
         for nid, img in self.necklaces.items():
-            opening = find_necklace_opening(img)
+            opening = find_necklace_outline_width(img)
             self.necklace_data[nid] = {
                 'image': img,
                 'opening_width': opening,
@@ -365,11 +399,6 @@ class TryOnSession:
             self.last_overlay_key = None
 
     def reset_calibration(self):
-        self.calibrated = False
-        self.cal_y_offset = 0.0
-        self.cal_width_ratio = 0.65
-        self.cal_neck_width = 0
-        self.calibration_attempts = 0
         self.one_euro_ls_x.reset()
         self.one_euro_ls_y.reset()
         self.one_euro_rs_x.reset()
@@ -405,55 +434,45 @@ class TryOnSession:
 
         angle = -np.degrees(np.arctan2(ls_y - rs_y, ls_x - rs_x))
 
-        # Calibration
-        status_msg = None
-        if not self.calibrated and self.calibration_attempts < CALIBRATION_FRAMES:
-            face_result = self.face_landmarker.detect(mp_image)
-            if face_result.face_landmarks:
-                lm = face_result.face_landmarks[0]
-                jaw_lower_left = lm[172]
-                jaw_lower_right = lm[397]
-                seg_mask = getattr(pose_result, 'segmentation_masks', None)
-                if seg_mask is not None:
-                    if isinstance(seg_mask, (list, tuple)):
-                        seg_mask = seg_mask[0]
-                    neck_from_seg = find_neck_edges_from_segmentation(
-                        seg_mask,
-                        (jaw_lower_left.x, jaw_lower_left.y),
-                        (jaw_lower_right.x, jaw_lower_right.y),
-                        shoulder_cy, h, w,
-                    )
-                    if neck_from_seg:
-                        neck_cy_from_seg = neck_from_seg['neck_center_y']
-                        neck_w_from_seg = neck_from_seg['neck_width']
-                        self.cal_y_offset = (neck_cy_from_seg - shoulder_cy) / max(shoulder_width, 1)
-                        self.cal_width_ratio = neck_w_from_seg / max(shoulder_width, 1)
-                        self.cal_neck_width = neck_w_from_seg
-                        self.calibration_attempts += 1
-                        if self.calibration_attempts >= CALIBRATION_FRAMES:
-                            self.calibrated = True
-                status_msg = f"CALIBRATING... {self.calibration_attempts}/{CALIBRATION_FRAMES}"
-            else:
-                status_msg = "Show face for calibration"
+        # Get face landmarks
+        face_result = self.face_landmarker.detect(mp_image)
+
+        # Live silhouette-based detection
+        shoulder_contour = None
+        if face_result.face_landmarks:
+            lm = face_result.face_landmarks[0]
+            jaw_lower_left = lm[172]
+            jaw_lower_right = lm[397]
+            seg_mask = getattr(pose_result, 'segmentation_masks', None)
+            if seg_mask is not None:
+                if isinstance(seg_mask, (list, tuple)):
+                    seg_mask = seg_mask[0]
+                shoulder_contour = find_shoulder_contour_from_segmentation(
+                    seg_mask,
+                    (jaw_lower_left.x, jaw_lower_left.y),
+                    (jaw_lower_right.x, jaw_lower_right.y),
+                    shoulder_cy, h, w,
+                )
 
         # Necklace position
+        status_msg = None
         self.frame_counter += 1
         nd = self.necklace_data[self.current_necklace_id]
         necklace = nd['image']
-        necklace_opening_width = nd['opening_width']
+        necklace_outline_width = nd['opening_width']
 
         if self.frame_counter % SKIP_FRAMES == 0:
             self.target_neck_cx = shoulder_cx
-            self.target_neck_cy = shoulder_cy + int(shoulder_width * self.cal_y_offset) + Y_LOWER
-            if necklace_opening_width is not None and self.calibrated:
-                open_ratio = necklace_opening_width / necklace.shape[1]
-                if open_ratio > 0.15:
-                    self.target_necklace_width = int(self.cal_neck_width / open_ratio)
-                    self.target_necklace_width = min(self.target_necklace_width, int(shoulder_width * 1.5))
-                else:
-                    self.target_necklace_width = int(shoulder_width * self.cal_width_ratio * WIDTH_PADDING)
+            if shoulder_contour:
+                self.target_neck_cy = shoulder_contour['center_y']
             else:
-                self.target_necklace_width = int(shoulder_width * self.cal_width_ratio * WIDTH_PADDING)
+                self.target_neck_cy = shoulder_cy
+            if necklace_outline_width is not None:
+                target_width = shoulder_width * 0.4
+                scale = target_width / necklace_outline_width
+                self.target_necklace_width = int(necklace.shape[1] * scale)
+            else:
+                self.target_necklace_width = int(shoulder_width * 0.4)
             self.target_angle = angle
 
         self.last_neck_cx = int(self.last_neck_cx + (self.target_neck_cx - self.last_neck_cx) * LERP_FACTOR)
@@ -493,7 +512,13 @@ class TryOnSession:
                 resized = edge_glow(resized, glow_radius=3, intensity=0.12)
                 center = (resized.shape[1] // 2, resized.shape[0] // 2)
                 M = cv2.getRotationMatrix2D(center, angle_out, 1.0)
-                resized = cv2.warpAffine(resized, M, (resized.shape[1], resized.shape[0]),
+                cos = abs(M[0, 0])
+                sin = abs(M[0, 1])
+                new_w = int(necklace_height * sin + necklace_width * cos)
+                new_h = int(necklace_height * cos + necklace_width * sin)
+                M[0, 2] += (new_w - resized.shape[1]) / 2
+                M[1, 2] += (new_h - resized.shape[0]) / 2
+                resized = cv2.warpAffine(resized, M, (new_w, new_h),
                                          borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
                 face_crop = frame_bgr[
                     max(0, cy_clamp - shoulder_half):min(h, cy_clamp + shoulder_half),
@@ -603,7 +628,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 resp = {"type": "frame", "data": b64}
                 if status:
                     resp["status"] = status
-                resp["calibrated"] = session.calibrated
 
                 await websocket.send_text(json.dumps(resp))
 
