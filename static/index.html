@@ -12,14 +12,23 @@
         <div id="overlay">
             <div id="status"></div>
             <div id="controls">
-                <button id="necklaceOpenBtn" class="control-btn">
-                    <img id="necklacePreview" src="" alt="">
-                    <span>Necklaces</span>
+                <button id="jewelryOpenBtn" class="control-btn">
+                    <span>Jewelry</span>
                 </button>
                 <label id="clipToggle" class="toggle-label">
                     <input type="checkbox" id="clipCheckbox" checked>
                     <span class="toggle-slider"></span>
                     Face Clip
+                </label>
+                <label id="debugMaskToggle" class="toggle-label">
+                    <input type="checkbox" id="debugMaskCheckbox">
+                    <span class="toggle-slider"></span>
+                    Debug Mask
+                </label>
+                <label id="debugSilhouetteToggle" class="toggle-label">
+                    <input type="checkbox" id="debugSilhouetteCheckbox">
+                    <span class="toggle-slider"></span>
+                    Debug Silhouette
                 </label>
                 <button id="resetBtn" title="Reset calibration">Reset</button>
             </div>
@@ -28,7 +37,10 @@
         <div id="sheetBackdrop"></div>
         <div id="sheet">
             <div id="sheetHandle"></div>
-            <div id="sheetTitle">Choose a Necklace</div>
+            <div id="sheetTabs">
+                <button class="sheet-tab active" data-category="necklaces">Necklaces</button>
+                <button class="sheet-tab" data-category="earrings">Earrings</button>
+            </div>
             <div id="sheetGrid"></div>
         </div>
     </div>

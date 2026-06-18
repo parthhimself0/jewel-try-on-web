@@ -137,12 +137,35 @@ body {
     flex-shrink: 0;
 }
 
-#sheetTitle {
-    color: #fff;
-    font-size: 16px;
-    font-weight: 600;
+#sheetTabs {
+    display: flex;
+    gap: 8px;
     margin-bottom: 16px;
     flex-shrink: 0;
+}
+
+.sheet-tab {
+    flex: 1;
+    padding: 10px 16px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.sheet-tab:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.8);
+}
+
+.sheet-tab.active {
+    background: rgba(255, 204, 0, 0.15);
+    border-color: #ffcc00;
+    color: #ffcc00;
 }
 
 #sheetGrid {
@@ -278,4 +301,20 @@ body {
 .toggle-label input:checked + .toggle-slider::after {
     left: 18px;
     background: #ffcc00;
+}
+
+.none-item {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.none-label {
+    color: rgba(255, 255, 255, 0.4);
+    font-size: 12px;
+    font-weight: 500;
+}
+
+.none-item.active .none-label {
+    color: #ffcc00;
 }

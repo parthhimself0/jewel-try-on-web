@@ -21,9 +21,10 @@ from mediapipe.tasks.python import vision
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = BASE_DIR
+ASSETS_DIR = BASE_DIR / "assets"
 
 NECKLACE_DIR = BASE_DIR / "static" / "necklaces"
+EARRING_DIR = BASE_DIR / "static" / "earrings"
 
 FACE_MODEL = str(ASSETS_DIR / "face_landmarker.task")
 POSE_MODEL = str(ASSETS_DIR / "pose_landmark_heavy.task")
@@ -216,6 +217,37 @@ def find_necklace_opening_anchor(img):
     return (w // 2, 0)
 
 
+def find_silhouette_edge_at_y(seg_mask, ear_x_norm, ear_y_norm, side, h, w):
+    if seg_mask is None:
+        return None
+    if hasattr(seg_mask, 'numpy_view'):
+        seg_mask = seg_mask.numpy_view()
+    seg_mask = np.array(seg_mask)
+    mh, mw = seg_mask.shape[:2]
+    binary = (seg_mask > 0.5).astype(np.uint8) if seg_mask.max() <= 1.0 else (seg_mask > 128).astype(np.uint8)
+
+    ear_y_mask = int(ear_y_norm * mh)
+    ear_x_mask = int(ear_x_norm * mw)
+    search_half = max(3, mh // 40)
+    y_start = max(0, ear_y_mask - search_half)
+    y_end = min(mh, ear_y_mask + search_half)
+
+    for row in range(y_start, y_end):
+        cols = np.where(binary[row, :] > 0)[0]
+        if len(cols) < 2:
+            continue
+        if side == "left":
+            left_edge = cols[0]
+            if left_edge < ear_x_mask:
+                return int(left_edge * w / mw)
+        else:
+            right_edge = cols[-1]
+            if right_edge > ear_x_mask:
+                return int(right_edge * w / mw)
+
+    return None
+
+
 def find_neck_edges_from_segmentation(seg_mask, jaw_left, jaw_right, shoulder_cy, h, w):
     if seg_mask is None:
         return None
@@ -333,21 +365,36 @@ def create_face_neck_mask(h, w, face_landmarks, neck_bottom_y):
         return mask
     lm = face_landmarks
 
-    pts = []
-    for idx in FACE_OVAL:
-        pts.append((int(lm[idx].x * w), int(lm[idx].y * h)))
+    pts = np.array([(int(lm[i].x * w), int(lm[i].y * h)) for i in range(len(lm))], dtype=np.int32)
+    hull = cv2.convexHull(pts)
+    hull_pts = hull.reshape(-1, 2)
 
-    left_x = min(p[0] for p in pts)
-    right_x = max(p[0] for p in pts)
-    jaw_bottom_y = max(p[1] for p in pts)
-    top_y = min(p[1] for p in pts)
+    left_x = int(hull_pts[:, 0].min())
+    right_x = int(hull_pts[:, 0].max())
+    jaw_bottom_y = int(hull_pts[:, 1].max())
+    top_y = int(hull_pts[:, 1].min())
     ext_y = min(jaw_bottom_y + int((jaw_bottom_y - top_y) * 0.3), neck_bottom_y)
 
-    pts += [(right_x, ext_y), (left_x, ext_y)]
+    extra = np.array([[right_x, ext_y], [left_x, ext_y]], dtype=np.int32)
+    full = np.vstack([hull_pts, extra])
+    full_hull = cv2.convexHull(full)
 
-    poly = np.array(pts, dtype=np.int32)
-    cv2.fillPoly(mask, [poly], 255)
+    cv2.fillConvexPoly(mask, full_hull, 255)
     mask = cv2.GaussianBlur(mask, (11, 11), 3)
+    return mask
+
+
+def create_face_only_mask(h, w, face_landmarks):
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if not face_landmarks:
+        return mask
+    lm = face_landmarks
+
+    pts = np.array([(int(lm[i].x * w), int(lm[i].y * h)) for i in range(len(lm))], dtype=np.int32)
+    hull = cv2.convexHull(pts)
+    cv2.fillConvexPoly(mask, hull, 255)
+
+    mask = cv2.GaussianBlur(mask, (7, 7), 2)
     return mask
 
 
@@ -415,6 +462,29 @@ class OneEuroFilter:
         self.t_prev = None
 
 
+def smooth_face_landmarks(current_lm, prev_lm, alpha=0.6):
+    """Blend current and previous face landmarks for temporal smoothing."""
+    if prev_lm is None:
+        return current_lm
+    smoothed = []
+    for i in range(len(current_lm)):
+        cx = current_lm[i].x
+        cy = current_lm[i].y
+        cz = current_lm[i].z
+        px = prev_lm[i].x
+        py = prev_lm[i].y
+        pz = prev_lm[i].z
+        # Create a new landmark-like object with blended values
+        class BlendedLM:
+            pass
+        blm = BlendedLM()
+        blm.x = alpha * px + (1 - alpha) * cx
+        blm.y = alpha * py + (1 - alpha) * cy
+        blm.z = alpha * pz + (1 - alpha) * cz
+        smoothed.append(blm)
+    return smoothed
+
+
 # ============================================================
 # TRY-ON SESSION (per WebSocket connection)
 # ============================================================
@@ -426,19 +496,27 @@ WIDTH_PADDING = 1.25
 
 
 class TryOnSession:
-    def __init__(self, face_landmarker, pose_landmarker, necklaces):
+    def __init__(self, face_landmarker, pose_landmarker, necklaces, earrings):
         self.face_landmarker = face_landmarker
         self.pose_landmarker = pose_landmarker
         self.necklaces = necklaces
-        self.current_necklace_id = 1
+        self.earrings = earrings
+        self.current_necklace_id = list(necklaces.keys())[0] if necklaces else None
+        self.current_earring_id = None
 
-        # Smoothing
+        # Smoothing - necklace
         self.one_euro_ls_x = OneEuroFilter(min_cutoff=0.3, beta=1.0)
         self.one_euro_ls_y = OneEuroFilter(min_cutoff=0.3, beta=1.0)
         self.one_euro_rs_x = OneEuroFilter(min_cutoff=0.3, beta=1.0)
         self.one_euro_rs_y = OneEuroFilter(min_cutoff=0.3, beta=1.0)
 
-        # Position state
+        # Smoothing - earrings
+        self.one_euro_left_ear_x = OneEuroFilter(min_cutoff=0.4, beta=0.8)
+        self.one_euro_left_ear_y = OneEuroFilter(min_cutoff=0.4, beta=0.8)
+        self.one_euro_right_ear_x = OneEuroFilter(min_cutoff=0.4, beta=0.8)
+        self.one_euro_right_ear_y = OneEuroFilter(min_cutoff=0.4, beta=0.8)
+
+        # Position state - necklace
         self.frame_counter = 0
         self.last_neck_cx = 0
         self.last_neck_cy = 0
@@ -449,10 +527,35 @@ class TryOnSession:
         self.target_necklace_width = 0
         self.target_angle = 0.0
 
+        # Position state - earrings
+        self.last_left_ear_x = 0
+        self.last_left_ear_y = 0
+        self.last_right_ear_x = 0
+        self.last_right_ear_y = 0
+        self.last_earring_width = 0
+        self.last_right_scale = 1.0
+        self.last_left_scale = 1.0
+        self.target_left_ear_x = 0
+        self.target_left_ear_y = 0
+        self.target_right_ear_x = 0
+        self.target_right_ear_y = 0
+        self.target_earring_width = 0
+        self.target_right_scale = 1.0
+        self.target_left_scale = 1.0
+
         # Overlay cache
         self.last_overlay = None
         self.last_overlay_key = None
         self.face_clip_enabled = True
+        self.earring_clip_enabled = True
+
+        # Face mask temporal smoothing
+        self.prev_face_landmarks = None
+        self.face_mask_alpha = 0.6  # blend factor: 0=full new, 1=full old
+
+        # Debug visualization
+        self.debug_mask = False
+        self.debug_silhouette = False
 
         # Last known good shoulder contour (for fallback when silhouette fails)
         self.last_good_shoulder_contour = None
@@ -469,11 +572,24 @@ class TryOnSession:
                 'opening_anchor': anchor,
             }
 
+        # Precompute earring data
+        self.earring_data = {}
+        for eid, img in self.earrings.items():
+            self.earring_data[eid] = {
+                'image': img,
+                'width': img.shape[1],
+                'height': img.shape[0],
+            }
+
     def select_necklace(self, nid):
-        if nid in self.necklaces:
+        if nid is None or nid in self.necklaces:
             self.current_necklace_id = nid
             self.last_overlay = None
             self.last_overlay_key = None
+
+    def select_earring(self, eid):
+        if eid is None or eid in self.earrings:
+            self.current_earring_id = eid
 
     def reset_calibration(self):
         self.one_euro_ls_x.reset()
@@ -514,16 +630,19 @@ class TryOnSession:
         # Get face landmarks
         face_result = self.face_landmarker.detect(mp_image)
 
+        # Extract segmentation mask early for earring use
+        seg_mask = getattr(pose_result, 'segmentation_masks', None)
+        if seg_mask is not None:
+            if isinstance(seg_mask, (list, tuple)):
+                seg_mask = seg_mask[0]
+
         # Live silhouette-based detection
         shoulder_contour = None
         if face_result.face_landmarks:
             lm = face_result.face_landmarks[0]
             jaw_lower_left = lm[172]
             jaw_lower_right = lm[397]
-            seg_mask = getattr(pose_result, 'segmentation_masks', None)
             if seg_mask is not None:
-                if isinstance(seg_mask, (list, tuple)):
-                    seg_mask = seg_mask[0]
                 shoulder_contour = find_shoulder_contour_from_segmentation(
                     seg_mask,
                     (jaw_lower_left.x, jaw_lower_left.y),
@@ -555,114 +674,354 @@ class TryOnSession:
 
         # Face/neck occlusion mask
         face_neck_mask = None
+        face_only_mask = None
         if face_result.face_landmarks:
+            face_lm = face_result.face_landmarks[0]
+
             best_contour_for_mask = shoulder_contour or self.last_good_shoulder_contour
             neck_bottom = best_contour_for_mask['center_y'] if best_contour_for_mask else shoulder_cy
-            face_neck_mask = create_face_neck_mask(h, w, face_result.face_landmarks[0], neck_bottom)
+            face_neck_mask = create_face_neck_mask(h, w, face_lm, neck_bottom)
+            face_only_mask = create_face_only_mask(h, w, face_lm)
 
         # Necklace position
         status_msg = None
         self.frame_counter += 1
-        nd = self.necklace_data[self.current_necklace_id]
-        necklace = nd['image']
-        necklace_outline_width = nd['opening_width']
 
-        if self.frame_counter % SKIP_FRAMES == 0:
-            self.target_neck_cx = shoulder_cx
-            # Use best available: current contour > last good contour > pose fallback
-            best_contour = shoulder_contour or self.last_good_shoulder_contour
-            if best_contour:
-                self.target_neck_cy = best_contour['center_y']
-                # Tilt-aware offset: shift Y along shoulder line direction
-                if 'left_x' in best_contour and 'right_x' in best_contour:
-                    contour_span = best_contour['right_x'] - best_contour['left_x']
-                    if contour_span > 0:
-                        tilt_ratio = (best_contour['center_x'] - shoulder_cx) / max(contour_span, 1)
-                        self.target_neck_cy += int(tilt_ratio * abs(ls_y - rs_y) * 0.3)
-            else:
-                self.target_neck_cy = shoulder_cy
-            if necklace_outline_width is not None:
-                target_width = shoulder_width * 0.4
-                scale = target_width / necklace_outline_width
-                self.target_necklace_width = int(necklace.shape[1] * scale)
-            else:
-                self.target_necklace_width = int(shoulder_width * 0.4)
-            self.target_angle = angle
+        # ========== NECKLACE RENDERING ==========
+        if self.current_necklace_id and self.current_necklace_id in self.necklace_data:
+            nd = self.necklace_data[self.current_necklace_id]
+            necklace = nd['image']
+            necklace_outline_width = nd['opening_width']
 
-        self.last_neck_cx = int(self.last_neck_cx + (self.target_neck_cx - self.last_neck_cx) * LERP_FACTOR)
-        self.last_neck_cy = int(self.last_neck_cy + (self.target_neck_cy - self.last_neck_cy) * LERP_FACTOR)
-        self.last_necklace_width = int(self.last_necklace_width + (self.target_necklace_width - self.last_necklace_width) * LERP_FACTOR)
-        self.last_angle = self.last_angle + (self.target_angle - self.last_angle) * LERP_FACTOR
+            if self.frame_counter % SKIP_FRAMES == 0:
+                self.target_neck_cx = shoulder_cx
+                # Use best available: current contour > last good contour > pose fallback
+                best_contour = shoulder_contour or self.last_good_shoulder_contour
+                if best_contour:
+                    self.target_neck_cy = best_contour['center_y']
+                    # Tilt-aware offset: shift Y along shoulder line direction
+                    if 'left_x' in best_contour and 'right_x' in best_contour:
+                        contour_span = best_contour['right_x'] - best_contour['left_x']
+                        if contour_span > 0:
+                            tilt_ratio = (best_contour['center_x'] - shoulder_cx) / max(contour_span, 1)
+                            self.target_neck_cy += int(tilt_ratio * abs(ls_y - rs_y) * 0.3)
+                else:
+                    self.target_neck_cy = shoulder_cy
+                if necklace_outline_width is not None:
+                    target_width = shoulder_width * 0.5
+                    scale = target_width / necklace_outline_width
+                    self.target_necklace_width = int(necklace.shape[1] * scale)
+                else:
+                    self.target_necklace_width = int(shoulder_width * 0.5)
+                self.target_angle = angle
 
-        necklace_width = self.last_necklace_width
-        angle_out = self.last_angle
-        scale = necklace_width / necklace.shape[1]
-        necklace_height = int(necklace.shape[0] * scale)
-        opening_anchor = nd['opening_anchor']
-        anchor_x = opening_anchor[0] * scale
-        anchor_y = opening_anchor[1] * scale
+            self.last_neck_cx = int(self.last_neck_cx + (self.target_neck_cx - self.last_neck_cx) * LERP_FACTOR)
+            self.last_neck_cy = int(self.last_neck_cy + (self.target_neck_cy - self.last_neck_cy) * LERP_FACTOR)
+            self.last_necklace_width = int(self.last_necklace_width + (self.target_necklace_width - self.last_necklace_width) * LERP_FACTOR)
+            self.last_angle = self.last_angle + (self.target_angle - self.last_angle) * LERP_FACTOR
 
-        if necklace_width > 20 and necklace_height > 20:
-            shoulder_half = shoulder_width // 4
-            lx_clamp = max(0, min(ls_x, w - 1))
-            rx_clamp = max(0, min(rs_x, w - 1))
-            cy_clamp = max(0, min(shoulder_cy, h - 1))
+            necklace_width = self.last_necklace_width
+            angle_out = self.last_angle
+            scale = necklace_width / necklace.shape[1]
+            necklace_height = int(necklace.shape[0] * scale)
+            opening_anchor = nd['opening_anchor']
+            anchor_x = opening_anchor[0] * scale
+            anchor_y = opening_anchor[1] * scale
 
-            left_region = frame_bgr[
-                max(0, cy_clamp - shoulder_half):min(h, cy_clamp + shoulder_half),
-                max(0, lx_clamp - shoulder_half):min(w, lx_clamp + shoulder_half),
-            ]
-            right_region = frame_bgr[
-                max(0, cy_clamp - shoulder_half):min(h, cy_clamp + shoulder_half),
-                max(0, rx_clamp - shoulder_half):min(w, rx_clamp + shoulder_half),
-            ]
-            left_brightness = np.mean(left_region) if left_region.size > 0 else 128
-            right_brightness = np.mean(right_region) if right_region.size > 0 else 128
-            lighting_shift = (right_brightness - left_brightness) / 255.0
+            if necklace_width > 20 and necklace_height > 20:
+                shoulder_half = shoulder_width // 4
+                lx_clamp = max(0, min(ls_x, w - 1))
+                rx_clamp = max(0, min(rs_x, w - 1))
+                cy_clamp = max(0, min(shoulder_cy, h - 1))
 
-            cur_key = (self.current_necklace_id, necklace_width, necklace_height, round(angle_out, 2))
-            if cur_key == self.last_overlay_key and self.last_overlay is not None:
-                resized = self.last_overlay
-            else:
-                resized = cv2.resize(necklace, (necklace_width, necklace_height), interpolation=cv2.INTER_AREA)
-                resized = edge_glow(resized, glow_radius=3, intensity=0.12)
-                center = (anchor_x, anchor_y)
-                M = cv2.getRotationMatrix2D(center, angle_out, 1.0)
-                cos = abs(M[0, 0])
-                sin = abs(M[0, 1])
-                new_w = int(necklace_height * sin + necklace_width * cos)
-                new_h = int(necklace_height * cos + necklace_width * sin)
-                M[0, 2] += (new_w - resized.shape[1]) / 2
-                M[1, 2] += (new_h - resized.shape[0]) / 2
-                resized = cv2.warpAffine(resized, M, (new_w, new_h),
-                                         borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
-                face_crop = frame_bgr[
+                left_region = frame_bgr[
                     max(0, cy_clamp - shoulder_half):min(h, cy_clamp + shoulder_half),
-                    max(0, lx_clamp):min(w, rx_clamp),
+                    max(0, lx_clamp - shoulder_half):min(w, lx_clamp + shoulder_half),
                 ]
-                resized = match_color_temperature(resized, face_crop)
-                resized = enhance_highlights(resized, lighting_shift, intensity=0.2)
-                resized = add_shimmer(resized, intensity=0.2)
-                resized = enhance_hdr(resized, contrast=1.6, saturation=1.05, brightness=0.75)
-                self.last_overlay = resized
-                self.last_overlay_key = cur_key
+                right_region = frame_bgr[
+                    max(0, cy_clamp - shoulder_half):min(h, cy_clamp + shoulder_half),
+                    max(0, rx_clamp - shoulder_half):min(w, rx_clamp + shoulder_half),
+                ]
+                left_brightness = np.mean(left_region) if left_region.size > 0 else 128
+                right_brightness = np.mean(right_region) if right_region.size > 0 else 128
+                lighting_shift = (right_brightness - left_brightness) / 255.0
 
-            anchor_canvas_x = anchor_x + (resized.shape[1] - necklace_width) / 2
-            anchor_canvas_y = anchor_y + (resized.shape[0] - necklace_height) / 2
-            x = self.last_neck_cx - anchor_canvas_x
-            y = self.last_neck_cy - anchor_canvas_y
+                cur_key = (self.current_necklace_id, necklace_width, necklace_height, round(angle_out, 2))
+                if cur_key == self.last_overlay_key and self.last_overlay is not None:
+                    resized = self.last_overlay
+                else:
+                    resized = cv2.resize(necklace, (necklace_width, necklace_height), interpolation=cv2.INTER_AREA)
+                    resized = edge_glow(resized, glow_radius=3, intensity=0.12)
+                    center = (anchor_x, anchor_y)
+                    M = cv2.getRotationMatrix2D(center, angle_out, 1.0)
+                    cos = abs(M[0, 0])
+                    sin = abs(M[0, 1])
+                    new_w = int(necklace_height * sin + necklace_width * cos)
+                    new_h = int(necklace_height * cos + necklace_width * sin)
+                    M[0, 2] += (new_w - resized.shape[1]) / 2
+                    M[1, 2] += (new_h - resized.shape[0]) / 2
+                    resized = cv2.warpAffine(resized, M, (new_w, new_h),
+                                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+                    face_crop = frame_bgr[
+                        max(0, cy_clamp - shoulder_half):min(h, cy_clamp + shoulder_half),
+                        max(0, lx_clamp):min(w, rx_clamp),
+                    ]
+                    resized = match_color_temperature(resized, face_crop)
+                    resized = enhance_highlights(resized, lighting_shift, intensity=0.2)
+                    resized = add_shimmer(resized, intensity=0.3)
+                    resized = enhance_hdr(resized, contrast=1.6, saturation=1.05, brightness=0.75)
+                    self.last_overlay = resized
+                    self.last_overlay_key = cur_key
 
-            if face_neck_mask is not None and self.face_clip_enabled:
-                resized = resized.copy()
-                apply_face_neck_occlusion(resized, face_neck_mask, int(x), int(y), feather=3)
+                anchor_canvas_x = anchor_x + (resized.shape[1] - necklace_width) / 2
+                anchor_canvas_y = anchor_y + (resized.shape[0] - necklace_height) / 2
+                x = self.last_neck_cx - anchor_canvas_x
+                y = self.last_neck_cy - anchor_canvas_y
 
-            add_skin_shadow(frame_bgr, resized[:, :, 3], int(x), int(y), offset_x=4, offset_y=6, blur=21, opacity=0.35)
-            overlay_realistic(frame_bgr, resized, int(x), int(y), lighting_shift=lighting_shift)
+                if face_neck_mask is not None and self.face_clip_enabled:
+                    resized = resized.copy()
+                    apply_face_neck_occlusion(resized, face_neck_mask, int(x), int(y), feather=3)
 
-            # Draw debug landmarks
-            cv2.circle(frame_bgr, (ls_x, ls_y), 4, (0, 255, 0), -1)
-            cv2.circle(frame_bgr, (rs_x, rs_y), 4, (0, 255, 0), -1)
-            cv2.circle(frame_bgr, (self.last_neck_cx, self.last_neck_cy), 4, (255, 255, 0), -1)
+                add_skin_shadow(frame_bgr, resized[:, :, 3], int(x), int(y), offset_x=4, offset_y=6, blur=21, opacity=0.35)
+                overlay_realistic(frame_bgr, resized, int(x), int(y), lighting_shift=lighting_shift)
+
+                # Draw debug landmarks
+                cv2.circle(frame_bgr, (ls_x, ls_y), 4, (0, 255, 0), -1)
+                cv2.circle(frame_bgr, (rs_x, rs_y), 4, (0, 255, 0), -1)
+                cv2.circle(frame_bgr, (self.last_neck_cx, self.last_neck_cy), 4, (255, 255, 0), -1)
+
+        # ========== EARRING RENDERING ==========
+        if self.current_earring_id and self.current_earring_id in self.earring_data:
+            ed = self.earring_data[self.current_earring_id]
+            earring_img = ed['image']
+
+            if face_result.face_landmarks:
+                flm = face_result.face_landmarks[0]
+
+                # MediaPipe face mesh ear landmarks
+                # 234 = right tragus, 454 = left tragus
+                # 58 = right jaw near ear, 288 = left jaw near ear
+                RIGHT_EAR = 234
+                LEFT_EAR = 454
+                RIGHT_JAW = 58
+                LEFT_JAW = 288
+                NOSE_TIP = 1
+
+                right_ear_lm = flm[RIGHT_EAR]
+                left_ear_lm = flm[LEFT_EAR]
+                right_jaw_lm = flm[RIGHT_JAW]
+                left_jaw_lm = flm[LEFT_JAW]
+                nose_lm = flm[NOSE_TIP]
+
+                # Y from midpoint of tragus and jaw
+                raw_right_y = (right_ear_lm.y * h + right_jaw_lm.y * h) / 2
+                raw_left_y = (left_ear_lm.y * h + left_jaw_lm.y * h) / 2
+
+                # X from midpoint of tragus and silhouette edge
+                mp_right_x = right_ear_lm.x * w
+                mp_left_x = left_ear_lm.x * w
+
+                sil_right_x = find_silhouette_edge_at_y(seg_mask, right_ear_lm.x, right_ear_lm.y, "left", h, w)
+                sil_left_x = find_silhouette_edge_at_y(seg_mask, left_ear_lm.x, left_ear_lm.y, "right", h, w)
+
+                raw_right_x = mp_right_x * 2/3 + sil_right_x * 1/3 if sil_right_x is not None else mp_right_x
+                raw_left_x = mp_left_x * 2/3 + sil_left_x * 1/3 if sil_left_x is not None else mp_left_x
+
+                # Filter ear positions
+                now_ear = time.time()
+                right_ear_x = int(self.one_euro_right_ear_x(raw_right_x, now_ear))
+                right_ear_y = int(self.one_euro_right_ear_y(raw_right_y, now_ear))
+                left_ear_x = int(self.one_euro_left_ear_x(raw_left_x, now_ear))
+                left_ear_y = int(self.one_euro_left_ear_y(raw_left_y, now_ear))
+
+                # Face width from face oval landmarks for earring scale
+                face_oval_pts = [(int(flm[i].x * w), int(flm[i].y * h)) for i in FACE_OVAL]
+                face_left_x = min(p[0] for p in face_oval_pts)
+                face_right_x = max(p[0] for p in face_oval_pts)
+                face_width = face_right_x - face_left_x
+                base_earring_width = max(16, int(face_width * 0.14))
+
+                # Perspective scale: lower ear (closer to camera) is bigger
+                nose_y = nose_lm.y * h
+                ear_distance = np.sqrt((left_ear_x - right_ear_x)**2 + (left_ear_y - right_ear_y)**2)
+                right_depth = (right_ear_y - nose_y) / max(ear_distance, 1)
+                left_depth = (left_ear_y - nose_y) / max(ear_distance, 1)
+                PERSPECTIVE_STRENGTH = 0.35
+                right_scale = 1.0 + right_depth * PERSPECTIVE_STRENGTH
+                left_scale = 1.0 + left_depth * PERSPECTIVE_STRENGTH
+                right_scale = max(0.6, min(1.4, right_scale))
+                left_scale = max(0.6, min(1.4, left_scale))
+
+                right_ew = max(12, int(base_earring_width * right_scale))
+                right_eh = int(earring_img.shape[0] * (right_ew / earring_img.shape[1]))
+                left_ew = max(12, int(base_earring_width * left_scale))
+                left_eh = int(earring_img.shape[0] * (left_ew / earring_img.shape[1]))
+
+                self.target_right_ear_x = right_ear_x
+                self.target_right_ear_y = right_ear_y
+                self.target_left_ear_x = left_ear_x
+                self.target_left_ear_y = left_ear_y
+                self.target_earring_width = base_earring_width
+                self.target_right_scale = right_scale
+                self.target_left_scale = left_scale
+
+                # Lerp
+                self.last_right_ear_x = int(self.last_right_ear_x + (self.target_right_ear_x - self.last_right_ear_x) * LERP_FACTOR)
+                self.last_right_ear_y = int(self.last_right_ear_y + (self.target_right_ear_y - self.last_right_ear_y) * LERP_FACTOR)
+                self.last_left_ear_x = int(self.last_left_ear_x + (self.target_left_ear_x - self.last_left_ear_x) * LERP_FACTOR)
+                self.last_left_ear_y = int(self.last_left_ear_y + (self.target_left_ear_y - self.last_left_ear_y) * LERP_FACTOR)
+                self.last_earring_width = int(self.last_earring_width + (self.target_earring_width - self.last_earring_width) * LERP_FACTOR)
+                self.last_right_scale = self.last_right_scale + (self.target_right_scale - self.last_right_scale) * LERP_FACTOR
+                self.last_left_scale = self.last_left_scale + (self.target_left_scale - self.last_left_scale) * LERP_FACTOR
+
+                # Get lighting for consistency
+                shoulder_half = shoulder_width // 4
+                lx_clamp = max(0, min(ls_x, w - 1))
+                rx_clamp = max(0, min(rs_x, w - 1))
+                cy_clamp = max(0, min(shoulder_cy, h - 1))
+                left_region = frame_bgr[
+                    max(0, cy_clamp - shoulder_half):min(h, cy_clamp + shoulder_half),
+                    max(0, lx_clamp - shoulder_half):min(w, lx_clamp + shoulder_half),
+                ]
+                right_region = frame_bgr[
+                    max(0, cy_clamp - shoulder_half):min(h, cy_clamp + shoulder_half),
+                    max(0, rx_clamp - shoulder_half):min(w, rx_clamp + shoulder_half),
+                ]
+                left_brightness = np.mean(left_region) if left_region.size > 0 else 128
+                right_brightness = np.mean(right_region) if right_region.size > 0 else 128
+                lighting_shift_ear = (right_brightness - left_brightness) / 255.0
+
+                # --- Render right earring ---
+                right_ew = max(12, int(self.last_earring_width * self.last_right_scale))
+                right_eh = int(earring_img.shape[0] * (right_ew / earring_img.shape[1])) if right_ew > 0 else 0
+
+                if right_ew > 10 and right_eh > 10:
+                    resized_ear = cv2.resize(earring_img, (right_ew, right_eh), interpolation=cv2.INTER_AREA)
+                    resized_ear = edge_glow(resized_ear, glow_radius=2, intensity=0.1)
+
+                    face_region_crop = frame_bgr[
+                        max(0, self.last_right_ear_y - right_eh):min(h, self.last_right_ear_y + right_eh),
+                        max(0, self.last_right_ear_x - right_ew):min(w, self.last_right_ear_x + right_ew),
+                    ]
+                    resized_ear = match_color_temperature(resized_ear, face_region_crop)
+                    resized_ear = enhance_highlights(resized_ear, lighting_shift_ear, intensity=0.15)
+                    resized_ear = add_shimmer(resized_ear, intensity=0.25)
+                    resized_ear = enhance_hdr(resized_ear, contrast=1.4, saturation=1.05, brightness=0.8)
+
+                    ear_x = self.last_right_ear_x - resized_ear.shape[1] // 2
+                    ear_y = self.last_right_ear_y
+
+                    # Face occlusion: hide earring parts that overlap the face
+                    if face_only_mask is not None and self.earring_clip_enabled:
+                        resized_ear = resized_ear.copy()
+                        apply_face_neck_occlusion(resized_ear, face_only_mask, int(ear_x), int(ear_y), feather=2)
+
+                    add_skin_shadow(frame_bgr, resized_ear[:, :, 3], int(ear_x), int(ear_y),
+                                    offset_x=2, offset_y=3, blur=11, opacity=0.25)
+                    overlay_realistic(frame_bgr, resized_ear, int(ear_x), int(ear_y),
+                                      lighting_shift=lighting_shift_ear)
+
+                # --- Render left earring (mirrored, different size) ---
+                left_ew = max(12, int(self.last_earring_width * self.last_left_scale))
+                left_eh = int(earring_img.shape[0] * (left_ew / earring_img.shape[1])) if left_ew > 0 else 0
+
+                if left_ew > 10 and left_eh > 10:
+                    resized_ear_l = cv2.resize(earring_img, (left_ew, left_eh), interpolation=cv2.INTER_AREA)
+                    resized_ear_l = edge_glow(resized_ear_l, glow_radius=2, intensity=0.1)
+
+                    resized_ear_l = cv2.flip(resized_ear_l, 1)
+
+                    face_region_crop_l = frame_bgr[
+                        max(0, self.last_left_ear_y - left_eh):min(h, self.last_left_ear_y + left_eh),
+                        max(0, self.last_left_ear_x - left_ew):min(w, self.last_left_ear_x + left_ew),
+                    ]
+                    resized_ear_l = match_color_temperature(resized_ear_l, face_region_crop_l)
+                    resized_ear_l = enhance_highlights(resized_ear_l, lighting_shift_ear, intensity=0.15)
+                    resized_ear_l = add_shimmer(resized_ear_l, intensity=0.25)
+                    resized_ear_l = enhance_hdr(resized_ear_l, contrast=1.4, saturation=1.05, brightness=0.8)
+
+                    ear_x_left = self.last_left_ear_x - resized_ear_l.shape[1] // 2
+                    ear_y_left = self.last_left_ear_y
+
+                    # Face occlusion
+                    if face_only_mask is not None and self.earring_clip_enabled:
+                        resized_ear_l = resized_ear_l.copy()
+                        apply_face_neck_occlusion(resized_ear_l, face_only_mask, int(ear_x_left), int(ear_y_left), feather=2)
+
+                    add_skin_shadow(frame_bgr, resized_ear_l[:, :, 3], int(ear_x_left), int(ear_y_left),
+                                    offset_x=-2, offset_y=3, blur=11, opacity=0.25)
+                    overlay_realistic(frame_bgr, resized_ear_l, int(ear_x_left), int(ear_y_left),
+                                      lighting_shift=lighting_shift_ear)
+
+        # Debug: render face mask as transparent green overlay
+        if self.debug_mask:
+            if face_only_mask is not None:
+                green_overlay = frame_bgr.copy()
+                green_overlay[:, :] = [0, 255, 0]  # BGR green
+                mask_float = face_only_mask.astype(np.float32) / 255.0
+                mask_3ch = np.stack([mask_float, mask_float, mask_float], axis=-1)
+                frame_bgr = (frame_bgr.astype(np.float32) * (1 - mask_3ch * 0.5) +
+                             green_overlay.astype(np.float32) * mask_3ch * 0.5).astype(np.uint8)
+
+            # Draw ear debug landmarks
+            if face_result.face_landmarks:
+                flm_dbg = face_result.face_landmarks[0]
+                # MediaPipe tragus (234/454) - cyan circles
+                tragus_r = (int(flm_dbg[234].x * w), int(flm_dbg[234].y * h))
+                tragus_l = (int(flm_dbg[454].x * w), int(flm_dbg[454].y * h))
+                cv2.circle(frame_bgr, tragus_r, 6, (255, 255, 0), 2)
+                cv2.circle(frame_bgr, tragus_l, 6, (255, 255, 0), 2)
+                cv2.putText(frame_bgr, "tragus", (tragus_r[0] + 10, tragus_r[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                cv2.putText(frame_bgr, "tragus", (tragus_l[0] - 50, tragus_l[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+                # Jaw landmarks (58/288) - orange circles
+                jaw_r = (int(flm_dbg[58].x * w), int(flm_dbg[58].y * h))
+                jaw_l = (int(flm_dbg[288].x * w), int(flm_dbg[288].y * h))
+                cv2.circle(frame_bgr, jaw_r, 6, (0, 165, 255), 2)
+                cv2.circle(frame_bgr, jaw_l, 6, (0, 165, 255), 2)
+                cv2.putText(frame_bgr, "jaw", (jaw_r[0] + 10, jaw_r[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+                cv2.putText(frame_bgr, "jaw", (jaw_l[0] - 30, jaw_l[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+
+                # Silhouette edges - green
+                sil_right = find_silhouette_edge_at_y(seg_mask, flm_dbg[234].x, flm_dbg[234].y, "left", h, w)
+                sil_left = find_silhouette_edge_at_y(seg_mask, flm_dbg[454].x, flm_dbg[454].y, "right", h, w)
+                ear_y_r = (tragus_r[1] + jaw_r[1]) // 2
+                ear_y_l = (tragus_l[1] + jaw_l[1]) // 2
+                if sil_right is not None:
+                    cv2.circle(frame_bgr, (sil_right, ear_y_r), 6, (0, 255, 0), 2)
+                    cv2.putText(frame_bgr, "sil", (sil_right + 10, ear_y_r),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                if sil_left is not None:
+                    cv2.circle(frame_bgr, (sil_left, ear_y_l), 6, (0, 255, 0), 2)
+                    cv2.putText(frame_bgr, "sil", (sil_left - 30, ear_y_l),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+                # Computed earlobe (X=mid tragus+silhouette, Y=mid tragus+jaw) - magenta
+                cv2.circle(frame_bgr, (self.last_right_ear_x, self.last_right_ear_y), 6, (255, 0, 255), 2)
+                cv2.putText(frame_bgr, "earlobe", (self.last_right_ear_x + 10, self.last_right_ear_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+                cv2.circle(frame_bgr, (self.last_left_ear_x, self.last_left_ear_y), 6, (255, 0, 255), 2)
+                cv2.putText(frame_bgr, "earlobe", (self.last_left_ear_x - 50, self.last_left_ear_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+
+        # Debug: render full body silhouette
+        if self.debug_silhouette and seg_mask is not None:
+            if hasattr(seg_mask, 'numpy_view'):
+                seg_vis = seg_mask.numpy_view()
+            else:
+                seg_vis = np.array(seg_mask)
+            seg_vis = (seg_vis * 255).astype(np.uint8) if seg_vis.max() <= 1.0 else seg_vis.astype(np.uint8)
+            seg_vis = cv2.resize(seg_vis, (w, h), interpolation=cv2.INTER_LINEAR)
+            blue_overlay = frame_bgr.copy()
+            blue_overlay[:, :] = [255, 0, 0]  # BGR blue
+            seg_float = seg_vis.astype(np.float32) / 255.0
+            seg_3ch = np.stack([seg_float, seg_float, seg_float], axis=-1)
+            frame_bgr = (frame_bgr.astype(np.float32) * (1 - seg_3ch * 0.5) +
+                         blue_overlay.astype(np.float32) * seg_3ch * 0.5).astype(np.uint8)
 
         return frame_bgr, status_msg
 
@@ -685,6 +1044,25 @@ for fpath in sorted(NECKLACE_DIR.glob("*.png")):
         img = np.dstack([img, alpha])
     img = crop_transparent(img)
     necklaces[nid] = img
+    print(f"  Loaded {fpath.name}: {img.shape}")
+
+print("Loading earring images...")
+earrings = {}
+EARRING_DIR.mkdir(parents=True, exist_ok=True)
+for fpath in sorted(EARRING_DIR.glob("*.png")):
+    eid = fpath.stem
+    img = cv2.imread(str(fpath), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        print(f"WARNING: Could not load {fpath}")
+        continue
+    if img.ndim == 2:
+        alpha = np.full(img.shape[:2], 255, dtype=np.uint8)
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+    elif img.shape[2] == 3:
+        alpha = np.full(img.shape[:2], 255, dtype=np.uint8)
+        img = np.dstack([img, alpha])
+    img = crop_transparent(img)
+    earrings[eid] = img
     print(f"  Loaded {fpath.name}: {img.shape}")
 
 print("Loading MediaPipe models...")
@@ -723,11 +1101,19 @@ async def list_necklaces():
     return {"necklaces": items}
 
 
+@app.get("/earrings")
+async def list_earrings():
+    items = []
+    for eid in sorted(earrings.keys()):
+        items.append({"id": eid, "name": eid.replace("_", " ").title(), "image": f"/static/earrings/{eid}.png"})
+    return {"earrings": items}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    session = TryOnSession(face_landmarker, pose_landmarker, necklaces)
-    print(f"Client connected. Total necklaces: {len(necklaces)}")
+    session = TryOnSession(face_landmarker, pose_landmarker, necklaces, earrings)
+    print(f"Client connected. Total necklaces: {len(necklaces)}, earrings: {len(earrings)}")
 
     try:
         while True:
@@ -757,7 +1143,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps(resp))
 
             elif msg.get("type") == "select_necklace":
-                nid = msg.get("id", 1)
+                nid = msg.get("id")
+                if nid is not None:
+                    nid = str(nid)
                 session.select_necklace(nid)
                 print(f"Switched to necklace {nid}")
 
@@ -767,7 +1155,27 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif msg.get("type") == "toggle_face_clip":
                 session.face_clip_enabled = msg.get("enabled", True)
+                session.earring_clip_enabled = msg.get("enabled", True)
                 print(f"Face clip: {'on' if session.face_clip_enabled else 'off'}")
+
+            elif msg.get("type") == "select_earring":
+                eid = msg.get("id")
+                if eid is not None:
+                    eid = str(eid)
+                session.select_earring(eid)
+                print(f"Switched to earring {eid}")
+
+            elif msg.get("type") == "toggle_earring_clip":
+                session.earring_clip_enabled = msg.get("enabled", True)
+                print(f"Earring clip: {'on' if session.earring_clip_enabled else 'off'}")
+
+            elif msg.get("type") == "toggle_debug_mask":
+                session.debug_mask = msg.get("enabled", False)
+                print(f"Debug mask: {'on' if session.debug_mask else 'off'}")
+
+            elif msg.get("type") == "toggle_debug_silhouette":
+                session.debug_silhouette = msg.get("enabled", False)
+                print(f"Debug silhouette: {'on' if session.debug_silhouette else 'off'}")
 
     except WebSocketDisconnect:
         print("Client disconnected")
