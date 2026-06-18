@@ -383,6 +383,10 @@ class TryOnSession:
         self.last_overlay = None
         self.last_overlay_key = None
 
+        # Last known good shoulder contour (for fallback when silhouette fails)
+        self.last_good_shoulder_contour = None
+        self.good_contour_frame_count = 0
+
         # Precompute necklace data
         self.necklace_data = {}
         for nid, img in self.necklaces.items():
@@ -454,6 +458,28 @@ class TryOnSession:
                     shoulder_cy, h, w,
                 )
 
+        # Sanity check: reject contour if it's too far from pose shoulder center
+        # or jumps too suddenly (likely caused by hand/arm in silhouette)
+        CONTOUR_MAX_OFFSET = 0.4  # max fraction of frame height from shoulder_cy
+        CONTOUR_MAX_JUMP = 0.3    # max fraction of frame height jump from last good
+        if shoulder_contour is not None:
+            cy = shoulder_contour['center_y']
+            offset = abs(cy - shoulder_cy) / h
+            too_far = offset > CONTOUR_MAX_OFFSET
+            jumped = False
+            if self.last_good_shoulder_contour is not None:
+                jump = abs(cy - self.last_good_shoulder_contour['center_y']) / h
+                jumped = jump > CONTOUR_MAX_JUMP
+            if too_far or jumped:
+                shoulder_contour = None
+
+        # Update last known good contour
+        if shoulder_contour is not None:
+            self.last_good_shoulder_contour = shoulder_contour
+            self.good_contour_frame_count = 0
+        else:
+            self.good_contour_frame_count += 1
+
         # Necklace position
         status_msg = None
         self.frame_counter += 1
@@ -463,8 +489,10 @@ class TryOnSession:
 
         if self.frame_counter % SKIP_FRAMES == 0:
             self.target_neck_cx = shoulder_cx
-            if shoulder_contour:
-                self.target_neck_cy = shoulder_contour['center_y']
+            # Use best available: current contour > last good contour > pose fallback
+            best_contour = shoulder_contour or self.last_good_shoulder_contour
+            if best_contour:
+                self.target_neck_cy = best_contour['center_y']
             else:
                 self.target_neck_cy = shoulder_cy
             if necklace_outline_width is not None:
