@@ -1,8 +1,7 @@
 fastapi
 uvicorn[standard]
 websockets
-opencv-python
-opencv-contrib-python
+opencv-python-headless
 mediapipe
 numpy
 psutil
