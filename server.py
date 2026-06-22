@@ -1088,6 +1088,11 @@ app = FastAPI(title="Jewelry Virtual Try-On")
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
 @app.get("/")
 async def index():
     return FileResponse(str(Path(__file__).parent / "static" / "index.html"))

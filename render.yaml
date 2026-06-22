@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: jewel-try-on
+    runtime: docker
+    dockerfilePath: Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    plan: starter
+    autoDeploy: true
