@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
+    libgles2-mesa \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
