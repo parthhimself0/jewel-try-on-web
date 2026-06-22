@@ -27,7 +27,7 @@ NECKLACE_DIR = BASE_DIR / "static" / "necklaces"
 EARRING_DIR = BASE_DIR / "static" / "earrings"
 
 FACE_MODEL = str(ASSETS_DIR / "face_landmarker.task")
-POSE_MODEL = str(ASSETS_DIR / "pose_landmark_heavy.task")
+POSE_MODEL = str(ASSETS_DIR / os.environ.get("POSE_MODEL_FILE", "pose_landmark_lite.task"))
 
 RAM_LIMIT = 90
 
